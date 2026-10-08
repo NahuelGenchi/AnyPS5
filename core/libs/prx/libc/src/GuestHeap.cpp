@@ -267,6 +267,15 @@ void* GuestHeapRealign_nid_postfix(void* pointer, std::size_t bytes, std::size_t
     return result;
 }
 
+std::size_t GuestHeapUsableSize_nid_postfix(void* pointer) {
+    if (pointer == nullptr) return 0;
+    GuestAllocations::Mutation mutation;
+    mutation.Find(pointer);
+    const auto raw = reinterpret_cast<std::uintptr_t>(reinterpret_cast<void**>(pointer)[-2]);
+    const auto blockBytes = reinterpret_cast<std::size_t*>(pointer)[-1];
+    return raw + blockBytes - reinterpret_cast<std::uintptr_t>(pointer);
+}
+
 void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes) {
     GuestAllocations::Mutation mutation;
     return allocate(mutation, alignment, bytes);

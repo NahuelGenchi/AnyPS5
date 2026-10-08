@@ -254,6 +254,10 @@ void* APS5_VABI calloc_nid_postfix(size_t count, size_t size) {
     return ApplicationHeapCalloc_nid_no_patch(count, size);
 }
 
+size_t APS5_VABI malloc_usable_size_nid_postfix(void* ptr) {
+    return ApplicationHeapUsableSize_nid_no_patch(ptr);
+}
+
 int APS5_VABI posix_memalign_nid_postfix(void** pointer, size_t alignment, size_t size) {
     if (!pointer || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return 22;
     const int savedError = errno;

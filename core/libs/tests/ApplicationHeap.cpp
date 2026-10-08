@@ -19,6 +19,7 @@ void APS5_VABI _ZdaPv_nid_postfix(void*);
 void APS5_VABI _ZdlPvSt11align_val_t_nid_postfix(void*, std::size_t);
 void APS5_VABI _ZdlPvmSt11align_val_t_nid_postfix(void*, std::size_t, std::size_t);
 void* ApplicationHeapRealign_nid_no_patch(void*, std::size_t, std::size_t);
+std::size_t APS5_VABI malloc_usable_size_nid_postfix(void*);
 char* APS5_VABI strdup_nid_postfix(const char*);
 char* APS5_VABI strndup_nid_postfix(const char*, std::size_t);
 int* APS5_VABI __error_nid_postfix();
@@ -33,6 +34,7 @@ std::size_t lastAlignment = 0;
 unsigned posixCalls = 0;
 unsigned initializes = 0;
 unsigned frees = 0;
+unsigned usableCalls = 0;
 bool fail = false;
 bool recurse = false;
 bool nullPosixResult = false;
@@ -93,6 +95,12 @@ int APS5_VABI posixAlign(void** pointer, std::size_t alignment, std::size_t byte
     return 0;
 }
 
+std::size_t APS5_VABI usableSize(void* pointer) {
+    require(pointer == storage.data());
+    ++usableCalls;
+    return storage.size();
+}
+
 template<typename TValue, std::size_t TSize>
 void write(std::array<std::byte, TSize>& data, std::size_t offset, TValue value) {
     require(offset <= data.size() && sizeof(value) <= data.size() - offset);
@@ -123,10 +131,20 @@ int main(int argc, char** argv) {
     write(replacement, 0x40, &align);
     write(replacement, 0x48, &realign);
     write(replacement, 0x50, &posixAlign);
+    write(replacement, 0x68, &usableSize);
     if (argc > 1 && std::strcmp(argv[1], "exit-order") == 0) {
         require(atexit_nid_postfix(exitCallbackAllocates) == 0);
         ApplicationHeapInitialize_nid_no_patch(process.data());
         require(initializes == 1);
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "no-usable-size") == 0) {
+        write(replacement, 0x68, static_cast<void*>(nullptr));
+        ApplicationHeapInitialize_nid_no_patch(process.data());
+        require(ApplicationHeapUsableSize_nid_no_patch(nullptr) == 0);
+        reject([] { ApplicationHeapUsableSize_nid_no_patch(storage.data()); });
+        reject([] { malloc_usable_size_nid_postfix(storage.data()); });
+        require(ApplicationHeapAllocate_nid_no_patch(8) == storage.data());
         return 0;
     }
     if (argc > 1 && std::strcmp(argv[1], "default") == 0) {
@@ -147,9 +165,23 @@ int main(int argc, char** argv) {
         pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(nullptr, 32));
         require(pointer != nullptr);
         ApplicationHeapFree_nid_no_patch(pointer);
+        require(ApplicationHeapUsableSize_nid_no_patch(nullptr) == 0 && malloc_usable_size_nid_postfix(nullptr) == 0);
+        for (const std::size_t bytes : {std::size_t{1}, std::size_t{37}, std::size_t{4096}, std::size_t{100000}}) {
+            auto* block = static_cast<unsigned char*>(ApplicationHeapAllocate_nid_no_patch(bytes));
+            const auto usable = malloc_usable_size_nid_postfix(block);
+            require(usable >= bytes);
+            std::memset(block, 0xa5, usable);
+            require(block[usable - 1] == 0xa5);
+            ApplicationHeapFree_nid_no_patch(block);
+        }
+        int notAllocated = 0;
+        reject([&] { ApplicationHeapUsableSize_nid_no_patch(&notAllocated); });
         for (std::size_t alignment : {16, 64, 4096}) {
             auto* aligned = ApplicationHeapAlign_nid_no_patch(alignment, 37);
             require(reinterpret_cast<std::uintptr_t>(aligned) % alignment == 0);
+            const auto usable = malloc_usable_size_nid_postfix(aligned);
+            require(usable >= 37);
+            std::memset(aligned, 0x5a, usable);
             _ZdlPvSt11align_val_t_nid_postfix(aligned, alignment);
         }
         void* aligned = nullptr;
@@ -184,6 +216,9 @@ int main(int argc, char** argv) {
     require(ApplicationHeapReallocate_nid_no_patch(pointer, 96) == storage.data() && lastSize == 96);
     ApplicationHeapFree_nid_no_patch(pointer);
     require(frees == 2);
+    require(ApplicationHeapUsableSize_nid_no_patch(storage.data()) == storage.size() && usableCalls == 1);
+    require(malloc_usable_size_nid_postfix(storage.data()) == storage.size() && usableCalls == 2);
+    require(ApplicationHeapUsableSize_nid_no_patch(nullptr) == 0 && malloc_usable_size_nid_postfix(nullptr) == 0 && usableCalls == 2);
     require(ApplicationHeapCalloc_nid_no_patch(3, 16) == storage.data() && lastSize == 48);
     require(ApplicationHeapPosixAlign_nid_no_patch(&pointer, 64, 128) == 0 && pointer == storage.data() && lastAlignment == 64);
     reject([] { ApplicationHeapAlign_nid_no_patch(3, 64); });
