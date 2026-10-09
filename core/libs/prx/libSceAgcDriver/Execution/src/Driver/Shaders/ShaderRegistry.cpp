@@ -297,6 +297,11 @@ std::uint32_t RegisterValue(const Registers& registers, std::uint32_t offset) {
     return found->second;
 }
 
+std::uint32_t RegisterValueOrZero(const Registers& registers, std::uint32_t offset) {
+    const auto found = registers.find(offset);
+    return found == registers.end() ? 0u : found->second;
+}
+
 void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, std::vector<std::uint64_t>& key) {
     key.clear();
     key.reserve(7u + state.shader.size() + state.context.size() + state.userConfig.size());
@@ -324,7 +329,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default: throw std::runtime_error("AGC driver: unsupported registered shader type");
     }
-    const auto high = RegisterValue(state.shader, programRegister + 1);
+    const auto high = RegisterValueOrZero(state.shader, programRegister + 1);
     if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
     const auto address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");

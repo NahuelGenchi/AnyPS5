@@ -13,6 +13,10 @@
 #include <vector>
 #include <future>
 #include <barrier>
+#include <cstring>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 namespace {
 
@@ -261,6 +265,40 @@ void Registration(bool indirect) {
     Require(destination == 0, "failed dispatch executed a subsequent memory write");
 }
 
+#ifdef __linux__
+void RegistrationWithoutProgramHigh() {
+    void* block = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (block == MAP_FAILED) return;
+    auto* code = static_cast<std::uint32_t*>(block);
+    code[0] = 0xbf810000u;
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 2> registers{};
+        std::array<ShaderRegister, 1> context{};
+        ShaderSpecialRegs specials{};
+        ShaderUserData userData{};
+    } header;
+    const auto address = reinterpret_cast<std::uintptr_t>(code);
+    Require(address >> 40u == 0u, "the shader code is not in the low address range");
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = 4;
+    header.shader.code = code;
+    header.shader.type = 2;
+    header.shader.user_data = &header.userData;
+    header.registers = {{{0x0c8, static_cast<std::uint32_t>(address >> 8u)}, {0x08b, 0}}};
+    header.context = {{{0x2d5, 0}}};
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.cx_registers = header.context.data();
+    header.shader.num_cx_registers = header.context.size();
+    header.shader.specials = &header.specials;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    munmap(block, 4096);
+}
+#endif
+
 }
 
 int main(int argc, char** argv) {
@@ -272,6 +310,9 @@ int main(int argc, char** argv) {
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
         device.reset();
+#ifdef __linux__
+        RegistrationWithoutProgramHigh();
+#endif
         Registration(argc == 2);
         std::cout << "prepared shader and transactional registration tests passed\n";
         return 0;
