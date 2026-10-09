@@ -260,6 +260,11 @@ if(BUILD_TESTING)
         set_tests_properties(guest_new_handler PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME guest_new_handler_default_heap COMMAND guest_new_handler_tests default)
+    if(WIN32)
+        set_tests_properties(guest_new_handler_default_heap PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_search_tests ${LIBS_INCLUDE_DIR}/tests/GuestSearch.cpp)
     target_include_directories(guest_search_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_search_tests PRIVATE libc)
