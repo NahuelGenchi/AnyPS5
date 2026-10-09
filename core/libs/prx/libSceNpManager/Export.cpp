@@ -10,6 +10,9 @@ static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003
 static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr int SCE_NP_ERROR_CALLBACK_ALREADY_REGISTERED = static_cast<int>(0x80550008);
 static constexpr int SCE_NP_ERROR_CALLBACK_NOT_REGISTERED = static_cast<int>(0x80550009);
+static constexpr int SCE_NP_ERROR_USER_NOT_FOUND = static_cast<int>(0x80550007);
+static constexpr int SCE_NP_ERROR_INVALID_SIZE = static_cast<int>(0x80550011);
+static constexpr int NP_CONTENT_RESTRICTION_COUNT_LIMIT = 0x100;
 static constexpr uint32_t NP_STATE_SIGNED_OUT = 1;
 static constexpr int NP_POLL_ASYNC_FINISHED = 0;
 static constexpr uint32_t NP_REACHABILITY_STATE_UNAVAILABLE = 0;
@@ -20,6 +23,9 @@ namespace {
 std::mutex reachabilityMutex;
 void* reachabilityCallback = nullptr;
 void* reachabilityUserdata = nullptr;
+std::mutex presenceMutex;
+void* presenceCallback = nullptr;
+void* presenceUserdata = nullptr;
 }
 
 extern "C" {
@@ -33,12 +39,10 @@ int APS5_VABI sceNpCheckCallback(void) {
     return 0;
 }
 
-int APS5_VABI sceNpCheckNpAvailability(int req_id, const char* user, void* result) {
- (void)req_id;
- (void)user;
- (void)result;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpCheckNpAvailability(int req_id, const NpOnlineId* online_id) {
+    (void)req_id;
+    if (!online_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return SCE_NP_ERROR_USER_NOT_FOUND;
 }
 
 int APS5_VABI sceNpCheckNpReachability(int req_id, int user_id) {
@@ -127,9 +131,9 @@ int APS5_VABI sceNpPollAsync(int req_id, int* result) {
 }
 
 void APS5_VABI sceNpRegisterGamePresenceCallback(void* callback, void* userdata) {
- (void)callback;
- (void)userdata;
- NotImplemented_nid_no_patch(__func__);
+    std::lock_guard lock(presenceMutex);
+    presenceCallback = callback;
+    presenceUserdata = userdata;
 }
 
 int APS5_VABI sceNpRegisterNpReachabilityStateCallback(void* callback, void* userdata) {
@@ -168,9 +172,12 @@ int APS5_VABI sceNpRegisterStateCallback(void* callback, void* userdata) {
 }
 
 int APS5_VABI sceNpSetContentRestriction(const NpContentRestriction* restriction) {
- (void)restriction;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+    if (!restriction) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (restriction->size != sizeof(NpContentRestriction)) return SCE_NP_ERROR_INVALID_SIZE;
+    if (restriction->default_age_restriction < 0 || restriction->age_restriction_count < 0 ||
+        restriction->age_restriction_count > NP_CONTENT_RESTRICTION_COUNT_LIMIT) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (restriction->age_restriction_count > 0 && restriction->age_restriction == nullptr) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return 0;
 }
 
 int APS5_VABI sceNpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret* title_secret) {
@@ -210,9 +217,9 @@ int APS5_VABI sceNpUnregisterPremiumEventCallback(void) {
     return 0;
 }
 
-int APS5_VABI sceNpGetUserIdByAccountId() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceNpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+    if (account_id == 0 || !user_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 }

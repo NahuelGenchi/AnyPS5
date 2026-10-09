@@ -1256,7 +1256,21 @@ struct Http2AsyncOption {
 
 struct NpTitleId { char data[13]; char pad[3]; };
 struct NpTitleSecret { std::uint8_t data[128]; };
-struct NpContentRestriction { std::uint8_t opaque[128]; };
+struct NpAgeRestriction {
+    char country_code[4];
+    std::int8_t age;
+    std::uint8_t padding[3];
+};
+static_assert(sizeof(NpAgeRestriction) == 8);
+
+struct NpContentRestriction {
+    std::uint64_t size;
+    std::int8_t default_age_restriction;
+    std::uint8_t padding[3];
+    std::int32_t age_restriction_count;
+    const NpAgeRestriction* age_restriction;
+};
+static_assert(sizeof(NpContentRestriction) == 24);
 struct NpOnlineId { char data[17]; char pad[3]; };
 struct NpId { NpOnlineId online_id; std::uint8_t opaque[4]; };
 struct NpCreateAsyncRequestParameter { std::uint8_t opaque[64]; };
