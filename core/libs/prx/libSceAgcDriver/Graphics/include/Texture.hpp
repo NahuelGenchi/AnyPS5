@@ -128,9 +128,10 @@ public:
     // so successive mip writes of a chain share one image and one write-back.
     VkImageView View(std::uint32_t mip);
     VkImageView FirstLayerView(std::uint32_t mip);
-    VkImageView StorageView(std::uint32_t mip, bool firstLayer);
-    VkImageView AtomicView(std::uint32_t mip, bool firstLayer);
-    VkImageView Atomic64View(std::uint32_t mip, bool firstLayer);
+    VkImageView OneSliceArrayView(std::uint32_t mip);
+    VkImageView StorageView(std::uint32_t mip, bool firstLayer, bool oneSliceArray = false);
+    VkImageView AtomicView(std::uint32_t mip, bool firstLayer, bool oneSliceArray = false);
+    VkImageView Atomic64View(std::uint32_t mip, bool firstLayer, bool oneSliceArray = false);
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }
@@ -425,7 +426,7 @@ private:
     // saying whether any live image overlaps the fill (see Texture.cpp).
     bool keysFillMatches(std::uint64_t address, std::size_t bytes, bool overlapped) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
-    VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
+    VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format, bool oneSliceArray = false) const;
     void release() noexcept;
 
     Context context;
@@ -475,8 +476,9 @@ private:
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;
     std::map<std::uint32_t, VkImageView> firstLayerViews;
-    std::map<std::pair<std::uint32_t, bool>, VkImageView> atomicViews;
-    std::map<std::pair<std::uint32_t, bool>, VkImageView> uintViews;
+    std::map<std::uint32_t, VkImageView> oneSliceArrayViews;
+    std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> atomicViews;
+    std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> uintViews;
     bool attachable = false;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     VkImage proxyImage = VK_NULL_HANDLE;

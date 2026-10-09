@@ -424,6 +424,7 @@ private:
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
+    std::vector<bool> storageOneSliceArray;
     std::vector<bool> storageWritten;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;

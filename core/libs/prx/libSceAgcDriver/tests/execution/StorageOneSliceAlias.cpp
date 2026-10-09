@@ -44,6 +44,10 @@ alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{
     0x7e020280, 0x7e04020c, 0xf0201108, 0x00010200, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 6> StoreArrayCode{
+    0x7e020280, 0x7e040280, 0x7e06020c, 0xf0201128, 0x00010300, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 9> LoadArrayCode{
     0x7e020280, 0x7e040280, 0xf0001128, 0x00010300, 0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000,
 };
@@ -146,6 +150,14 @@ void Store(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uin
     Dispatch(device, StoreCode, userData);
 }
 
+void StoreArray(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uint32_t value) {
+    std::vector<std::uint32_t> userData(16, 0u);
+    const auto texture = TextureDescriptor(texels, Type2DArray);
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    userData[12] = value;
+    Dispatch(device, StoreArrayCode, userData);
+}
+
 void LoadArray(AgcDriver::VulkanDevice& device, const std::uint8_t* texels) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(16, 0u);
@@ -188,6 +200,25 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
+void RunShared(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    StoreArray(device, texels, 0x33333333u);
+    const auto shared = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(shared != nullptr && shared->Descriptor().dimension == AgcDriver::Graphics::TextureDimension::k2D, "the store through the one-slice array left no pending 2D image");
+    Store(device, texels, 0x44444444u);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) == shared, "the 2D store wrote another image than the one-slice array's");
+    LoadArray(device, texels);
+    RequireOutput(0x44444444u, "the load through the one-slice array after the 2D store");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(std::count(reinterpret_cast<const std::uint32_t*>(texels), reinterpret_cast<const std::uint32_t*>(texels) + SurfaceBytes / 4u, 0x44444444u) == static_cast<std::ptrdiff_t>(Threads), "guest memory does not hold the 32 texels of the 2D store after the flush");
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
 }
 
 int main() {
@@ -198,6 +229,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         if (!watched) std::puts("guest memory has no write watch: only the texels read through the array are checked");
         Run(*device, block.Data(), watched);
+        RunShared(*device, block.Data());
         std::puts("storage one-slice alias tests passed");
         return 0;
     } catch (const std::exception& error) {

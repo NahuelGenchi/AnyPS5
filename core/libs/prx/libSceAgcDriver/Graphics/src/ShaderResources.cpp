@@ -636,6 +636,14 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
+std::optional<GuestTextureResource> OneSliceTwin(const GuestTextureResource& resource) {
+    if (resource.depthOrLastArray != 0 || resource.baseArray != 0) return std::nullopt;
+    if (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray) return std::nullopt;
+    auto twin = resource;
+    twin.dimension = resource.dimension == TextureDimension::k2D ? TextureDimension::k2DArray : TextureDimension::k2D;
+    return twin;
+}
+
 struct ExtendedSurfaces {
     std::mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
@@ -700,6 +708,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         evictStorage(cache, it);
         it = cache.entries.end();
     }
+    if (it == cache.entries.end()) {
+        if (const auto twin = OneSliceTwin(resource); twin.has_value()) {
+            const auto found = findStorage(cache, {context.device, SurfaceKey(context, *twin)});
+            if (found != cache.entries.end() && !MetadataMoved(*found->texture, *twin) && found->texture->GuestBytes() == (guestBytes != 0 ? guestBytes : DescribeSurface(resource).guestBytes)) it = found;
+        }
+    }
     if (it != cache.entries.end()) {
         it->texture->Refresh();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
@@ -712,7 +726,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+    auto made = resource;
+    if (const auto twin = OneSliceTwin(resource); twin.has_value() && resource.dimension == TextureDimension::k2DArray && DescribeSurface(*twin).guestBytes == guestBytes) made = *twin;
+    const StorageKey madeKey{context.device, SurfaceKey(context, made)};
+    CachedStorageTexture entry{madeKey, mip, std::make_shared<StorageTexture>(context, *context.detiler, made, mip)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
     // so an eviction or a failed view before it ran cannot destroy a referenced image.
@@ -725,7 +742,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
     cache.entries.push_front(std::move(entry));
-    cache.index[key] = cache.entries.begin();
+    cache.index[madeKey] = cache.entries.begin();
     cache.byImage[texture.get()] = cache.entries.begin();
     texture->SetCached(true);
     counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
@@ -1307,7 +1324,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
-                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
+                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index], storageOneSliceArray[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index], storageOneSliceArray[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], storageOneSliceArray[index]), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -2906,17 +2923,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             continue;
         }
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
-        const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
-        if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+        const bool viewsFirstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+        if (binding.imageShape.has_value() && !viewsFirstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
+        const auto held = storageTextures.back()->Descriptor().dimension;
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
-        storageFirstLayer.push_back(firstLayer);
+        storageFirstLayer.push_back(binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && held == TextureDimension::k2DArray);
+        storageOneSliceArray.push_back(binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DArray && held == TextureDimension::k2D);
         // Images the shader only reads have nothing to store back.
         storageWritten.push_back(element >= binding.imageWritten.size() || binding.imageWritten[element]);
         storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);

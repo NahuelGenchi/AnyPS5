@@ -460,7 +460,9 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    const auto oneSlice = [](const GuestTextureResource& resource) { return (resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray) && resource.depthOrLastArray == 0 && resource.baseArray == 0; };
+    const bool sameDimension = descriptor.dimension == from.dimension || (oneSlice(descriptor) && oneSlice(from));
+    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && sameDimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -1000,17 +1002,18 @@ bool AdjacentGenerationEnabled() {
 
 }
 
-VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
+VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format, bool oneSliceArray) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
     Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
-    const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
+    Require(!oneSliceArray || (descriptor.dimension == TextureDimension::k2D && geometry.imageLayers - descriptor.baseArray == 1u), "a one-slice array storage view needs a 2D surface of one layer");
+    const auto viewLayerCount = firstLayer || oneSliceArray ? 1u : geometry.imageLayers - descriptor.baseArray;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = format == storageFormat ? nullptr : &usage;
     viewInfo.image = image;
     // Storage views address one mip; cube faces are written as array layers.
-    viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : oneSliceArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, descriptor.baseArray, viewLayerCount};
@@ -1147,35 +1150,43 @@ VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
     return created;
 }
 
-VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer) {
+VkImageView StorageTexture::OneSliceArrayView(std::uint32_t mip) {
+    const auto found = oneSliceArrayViews.find(mip);
+    if (found != oneSliceArrayViews.end()) return found->second;
+    const auto created = createView(mip, false, storageFormat, true);
+    oneSliceArrayViews.emplace(mip, created);
+    return created;
+}
+
+VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, bool oneSliceArray) {
     const auto format = UintFormatOfSint(storageFormat);
-    if (format == VK_FORMAT_UNDEFINED) return firstLayer ? FirstLayerView(mip) : View(mip);
-    if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer);
-    const auto found = uintViews.find({mip, firstLayer});
+    if (format == VK_FORMAT_UNDEFINED) return firstLayer ? FirstLayerView(mip) : oneSliceArray ? OneSliceArrayView(mip) : View(mip);
+    if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer, oneSliceArray);
+    const auto found = uintViews.find({mip, firstLayer, oneSliceArray});
     if (found != uintViews.end()) return found->second;
     Require(StorageFormatOrUndefined(context, format) == format, "storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(format));
-    const auto created = createView(mip, firstLayer, format);
-    uintViews.emplace(std::pair{mip, firstLayer}, created);
+    const auto created = createView(mip, firstLayer, format, oneSliceArray);
+    uintViews.emplace(std::tuple{mip, firstLayer, oneSliceArray}, created);
     return created;
 }
 
-VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer) {
-    if (storageFormat == VK_FORMAT_R32_UINT) return firstLayer ? FirstLayerView(mip) : View(mip);
+VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer, bool oneSliceArray) {
+    if (storageFormat == VK_FORMAT_R32_UINT) return firstLayer ? FirstLayerView(mip) : oneSliceArray ? OneSliceArrayView(mip) : View(mip);
     Require(storageFormat == VK_FORMAT_R32_SINT || storageFormat == VK_FORMAT_R32_SFLOAT, "storage image atomics need a surface of one 32-bit component");
-    const auto found = atomicViews.find({mip, firstLayer});
+    const auto found = atomicViews.find({mip, firstLayer, oneSliceArray});
     if (found != atomicViews.end()) return found->second;
-    const auto created = createView(mip, firstLayer, VK_FORMAT_R32_UINT);
-    atomicViews.emplace(std::pair{mip, firstLayer}, created);
+    const auto created = createView(mip, firstLayer, VK_FORMAT_R32_UINT, oneSliceArray);
+    atomicViews.emplace(std::tuple{mip, firstLayer, oneSliceArray}, created);
     return created;
 }
 
-VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
-    if (storageFormat == VK_FORMAT_R64_UINT) return firstLayer ? FirstLayerView(mip) : View(mip);
+VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer, bool oneSliceArray) {
+    if (storageFormat == VK_FORMAT_R64_UINT) return firstLayer ? FirstLayerView(mip) : oneSliceArray ? OneSliceArrayView(mip) : View(mip);
     Require(storageFormat == VK_FORMAT_R32G32_UINT || storageFormat == VK_FORMAT_R32G32_SINT || storageFormat == VK_FORMAT_R32G32_SFLOAT, "64-bit storage image atomics need a surface of two 32-bit components");
-    const auto found = atomicViews.find({mip, firstLayer});
+    const auto found = atomicViews.find({mip, firstLayer, oneSliceArray});
     if (found != atomicViews.end()) return found->second;
-    const auto created = createView(mip, firstLayer, VK_FORMAT_R64_UINT);
-    atomicViews.emplace(std::pair{mip, firstLayer}, created);
+    const auto created = createView(mip, firstLayer, VK_FORMAT_R64_UINT, oneSliceArray);
+    atomicViews.emplace(std::tuple{mip, firstLayer, oneSliceArray}, created);
     return created;
 }
 
@@ -3831,6 +3842,8 @@ void StorageTexture::release() noexcept {
     extraViews.clear();
     for (const auto& [mip, extra] : firstLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
     firstLayerViews.clear();
+    for (const auto& [mip, extra] : oneSliceArrayViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
+    oneSliceArrayViews.clear();
     for (const auto& [key, atomic] : atomicViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, atomic, nullptr);
     atomicViews.clear();
     for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
