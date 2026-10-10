@@ -1,6 +1,7 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
+#include <array>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -337,28 +338,117 @@ std::unordered_set<const IrBlock*> blocksOutsideLoops(const IrProgram& program) 
     return result;
 }
 
-bool unobservedWhereMasked(const IrProgram& program, const std::unordered_set<const IrBlock*>& once, const IrValue& select, const IrValue* mask) {
-    const auto waveSize = program.WaveSize();
-    std::vector<const IrValue*> pending{&select};
-    std::unordered_set<const IrValue*> visited{&select};
-    while (!pending.empty()) {
-        const IrValue* value = pending.back();
-        pending.pop_back();
-        for (const IrUse& use : value->OperandUses()) {
-            const IrValue* user = use.user;
-            if (user->Parent() == nullptr || !once.contains(user->Parent())) return false;
-            if (isSelect(user->Opcode()) && use.operand == 1u && implies(user->Argument(0), mask, waveSize)) continue;
-            if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implies(user->Argument(1u - use.operand), mask, waveSize)) continue;
-            if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implies(user->Argument(user->ArgumentCount() - 1u), mask, waveSize)) continue;
-            if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user)) return false;
-            if (visited.insert(user).second) {
-                if (visited.size() > VisitLimit) return false;
-                pending.push_back(user);
+const IrValue* readCondition(const IrValue& user, std::size_t operand) {
+    if (isSelect(user.Opcode()) && operand == 1u) return user.Argument(0);
+    if (user.Opcode() == IrOpcode::LogicalAnd && operand < 2u) return user.Argument(1u - operand);
+    if (readsOnlyWhereActive(user.Opcode()) && operand + 1u < user.ArgumentCount()) return user.Argument(user.ArgumentCount() - 1u);
+    return nullptr;
+}
+
+bool carriesLanes(const IrProgram& program, const IrValue& user) {
+    return user.IsPhi() || isLaneLocal(user.Opcode()) || isExplicitLodSample(program, user);
+}
+
+struct ObserverPath {
+    static constexpr std::size_t GuardLimit = 2;
+
+    bool found = false;
+    std::size_t guardCount = 0;
+    std::array<IrUse, GuardLimit> guards{};
+};
+
+class SelectObservers {
+public:
+    SelectObservers(const IrProgram& program, const std::unordered_set<const IrBlock*>& once) : program(program), once(once) {}
+
+    ObserverPath PathFrom(const IrValue& value) const {
+        ObserverPath shortest;
+        for (const IrUse& use : value.OperandUses()) {
+            const IrValue& user = *use.user;
+            ObserverPath path;
+            if (user.Parent() == nullptr || !once.contains(user.Parent())) {
+                path.found = !isSelect(user.Opcode());
+            } else {
+                if (carriesLanes(program, user)) path = remembered(user);
+                else path.found = true;
+                if (path.found && readCondition(user, use.operand) != nullptr) path.found = guard(path, use);
+            }
+            if (!path.found) continue;
+            if (!shortest.found || path.guardCount < shortest.guardCount) shortest = path;
+            if (shortest.guardCount == 0u) break;
+        }
+        return shortest;
+    }
+
+    void Remember(const IrValue& value, const ObserverPath& path) {
+        if (!path.found) return;
+        if (value.Id() >= paths.size()) paths.resize(static_cast<std::size_t>(value.Id()) + 1u);
+        paths[value.Id()] = path;
+    }
+
+    bool ObservedAlong(const ObserverPath& path, const IrValue* mask) const {
+        if (!path.found) return false;
+        for (std::size_t index = 0; index < path.guardCount; ++index) {
+            const IrUse& use = path.guards[index];
+            if (implies(readCondition(*use.user, use.operand), mask, program.WaveSize())) return false;
+        }
+        return true;
+    }
+
+    bool UnobservedWhereMasked(const IrValue& select, const IrValue* mask) {
+        const auto waveSize = program.WaveSize();
+        ++search;
+        std::size_t visited = 1;
+        visit(select);
+        pending.assign(1, &select);
+        while (!pending.empty()) {
+            const IrValue* value = pending.back();
+            pending.pop_back();
+            for (const IrUse& use : value->OperandUses()) {
+                const IrValue* user = use.user;
+                if (user->Parent() == nullptr || !once.contains(user->Parent())) return false;
+                const IrValue* condition = readCondition(*user, use.operand);
+                if (condition != nullptr && implies(condition, mask, waveSize)) continue;
+                if (!carriesLanes(program, *user)) return false;
+                if (visit(*user)) {
+                    if (++visited > VisitLimit) return false;
+                    pending.push_back(user);
+                }
             }
         }
+        return true;
     }
-    return true;
-}
+
+private:
+    ObserverPath remembered(const IrValue& value) const {
+        return value.Id() < paths.size() ? paths[value.Id()] : ObserverPath{};
+    }
+
+    static bool guard(ObserverPath& path, const IrUse& use) {
+        const IrValue* condition = readCondition(*use.user, use.operand)->Resolve();
+        for (std::size_t index = 0; index < path.guardCount; ++index) {
+            const IrUse& guarded = path.guards[index];
+            if (readCondition(*guarded.user, guarded.operand)->Resolve() == condition) return true;
+        }
+        if (path.guardCount == ObserverPath::GuardLimit) return false;
+        path.guards[path.guardCount++] = use;
+        return true;
+    }
+
+    bool visit(const IrValue& value) {
+        if (value.Id() >= visitedIn.size()) visitedIn.resize(static_cast<std::size_t>(value.Id()) + 1u, 0u);
+        if (visitedIn[value.Id()] == search) return false;
+        visitedIn[value.Id()] = search;
+        return true;
+    }
+
+    const IrProgram& program;
+    const std::unordered_set<const IrBlock*>& once;
+    std::vector<ObserverPath> paths;
+    std::vector<std::uint32_t> visitedIn;
+    std::vector<const IrValue*> pending;
+    std::uint32_t search = 0;
+};
 
 }
 
@@ -368,6 +458,7 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
     bool changed = true;
     while (changed) {
         changed = false;
+        SelectObservers observers(program, once);
         for (auto blockIt = program.BlockOrder().rbegin(); blockIt != program.BlockOrder().rend(); ++blockIt) {
             const bool single = once.contains(*blockIt);
             auto& instructions = (*blockIt)->Instructions();
@@ -375,15 +466,21 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
             while (it != instructions.begin()) {
                 --it;
                 IrValue* inst = *it;
-                if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
-                const IrValue* mask = inst->Argument(0)->Resolve();
-                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !unobservedWhereMasked(program, once, *inst, mask))) continue;
-                inst->ReplaceAllUsesWith(inst->Argument(1));
-                inst->Invalidate();
-                inst->SetParent(nullptr);
-                it = instructions.erase(it);
-                ++stats.removedSelects;
-                changed = true;
+                const bool tracked = single && carriesLanes(program, *inst);
+                const auto path = tracked ? observers.PathFrom(*inst) : ObserverPath{};
+                if (isSelect(inst->Opcode()) && inst->ArgumentCount() == 3u && inst->HasUses()) {
+                    const IrValue* mask = inst->Argument(0)->Resolve();
+                    if (alwaysTrue(mask, program.WaveSize()) || (single && !observers.ObservedAlong(path, mask) && observers.UnobservedWhereMasked(*inst, mask))) {
+                        inst->ReplaceAllUsesWith(inst->Argument(1));
+                        inst->Invalidate();
+                        inst->SetParent(nullptr);
+                        it = instructions.erase(it);
+                        ++stats.removedSelects;
+                        changed = true;
+                        continue;
+                    }
+                }
+                if (tracked) observers.Remember(*inst, path);
             }
         }
         if (changed) DeadCodeEliminator{}.Eliminate(program);

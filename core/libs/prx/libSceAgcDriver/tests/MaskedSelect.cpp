@@ -374,5 +374,68 @@ int main() {
         return !guarded(IrOpcode::SharedAtomicIAdd32, true, false);
     });
 
+    const auto readTwice = [](bool wideFirst) {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(16u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        b.keep(b.select(wideFirst ? wide : exec, b.add(written, 2u), old));
+        b.keep(b.select(wideFirst ? exec : wide, b.add(written, 3u), old));
+        return b.eliminate() == 0u && !removed(written);
+    };
+
+    passed &= run("a write read under its own exec and under a wider one must keep its select", [&] {
+        return readTwice(false) && readTwice(true);
+    });
+
+    const auto readThroughChain = [](std::uint32_t length, bool ownExecFirst) {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrValue* last = &written;
+        for (std::uint32_t link = 0; link < length; ++link) {
+            auto& reader = link == 0u && ownExecFirst ? exec : b.mask(20u + link);
+            last = &b.select(reader, b.add(*last, 2u), old);
+        }
+        b.keep(*last);
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a write read through a chain of unrelated execs must keep its select", [&] {
+        bool ok = true;
+        for (std::uint32_t length = 1; length <= 6u; ++length) {
+            const auto [count, gone] = readThroughChain(length, false);
+            ok &= count == 0u && !gone;
+        }
+        return ok;
+    });
+
+    passed &= run("a write first read under its own exec must lose its select whatever reads the result", [&] {
+        bool ok = true;
+        for (std::uint32_t length = 1; length <= 6u; ++length) {
+            const auto [count, gone] = readThroughChain(length, true);
+            ok &= count == 1u && gone;
+        }
+        return ok;
+    });
+
+    passed &= run("reads under one wider exec must collapse around a write that stays", [] {
+        bool ok = true;
+        for (std::uint32_t length = 1; length <= 6u; ++length) {
+            Builder b;
+            auto& wide = b.mask(48u);
+            auto& exec = b.logicalAnd(wide, b.mask(16u));
+            auto& old = b.lane();
+            auto& written = b.select(exec, b.add(old, 1u), old);
+            IrValue* last = &written;
+            for (std::uint32_t link = 0; link < length; ++link) last = &b.select(wide, b.add(*last, 2u), old);
+            b.keep(*last);
+            ok &= b.eliminate() == length - 1u && !removed(written) && !removed(*last);
+        }
+        return ok;
+    });
+
     return passed ? 0 : 1;
 }
