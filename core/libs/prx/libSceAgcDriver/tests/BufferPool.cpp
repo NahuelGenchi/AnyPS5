@@ -191,6 +191,45 @@ void Budget() {
     Expect(probe.Handle() != first, "the least recently used device buffer survived the eviction");
 }
 
+VkPhysicalDeviceMemoryProperties Heaps(VkDeviceSize deviceLocal, VkDeviceSize host) {
+    VkPhysicalDeviceMemoryProperties memory = mockContext().memory;
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {host, 0};
+    memory.memoryHeaps[1] = {deviceLocal, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    return memory;
+}
+
+void HeapBudget() {
+    constexpr VkDeviceSize GiB = VkDeviceSize{1} << 30u;
+    Expect(BufferPool::DeviceBudget(mockContext().memory) == 512 * MiB, "the device tier of a device without a device-local heap does not keep 512 MiB");
+    Expect(BufferPool::DeviceBudget(Heaps(2 * GiB, 10 * GiB)) == 128 * MiB, "the device tier of a 2 GiB card keeps " + std::to_string(BufferPool::DeviceBudget(Heaps(2 * GiB, 10 * GiB)) / MiB) + " MiB, not a sixteenth of its video memory");
+    Expect(BufferPool::DeviceBudget(Heaps(4 * GiB, 16 * GiB)) == 256 * MiB, "the device tier of a 4 GiB card does not keep 256 MiB");
+    Expect(BufferPool::DeviceBudget(Heaps(8 * GiB, 16 * GiB)) == 512 * MiB && BufferPool::DeviceBudget(Heaps(24 * GiB, 32 * GiB)) == 512 * MiB, "the device tier of a card with 8 GiB or more does not keep the 512 MiB of before");
+    auto shared = Heaps(256 * MiB, 0);
+    shared.memoryHeapCount = 3;
+    shared.memoryHeaps[2] = {6 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    Expect(BufferPool::DeviceBudget(shared) == 384 * MiB, "the device tier is not sized from the largest device-local heap");
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.memory = Heaps(2 * GiB, 10 * GiB);
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    std::vector<std::unique_ptr<DeviceBuffer>> live;
+    for (int i = 0; i < 12; ++i) live.push_back(std::make_unique<DeviceBuffer>(context, (12 + static_cast<std::size_t>(i)) * MiB, usage));
+    const auto first = live.front()->Handle();
+    const auto last = live.back()->Handle();
+    VkDeviceSize madeBytes = 0;
+    for (const auto& buffer : live) madeBytes += mock.sizes.at(buffer->Handle());
+    Expect(madeBytes > 128 * MiB && madeBytes <= 512 * MiB, "the 2 GiB case does not lie between the two budgets");
+    for (auto& buffer : live) buffer.reset();
+    Expect(mock.frees != 0 && mock.liveBytes <= 128 * MiB, "the device tier of a 2 GiB card retains " + std::to_string(mock.liveBytes / MiB) + " MiB after " + std::to_string(mock.frees) + " evictions, over its 128 MiB budget");
+    Expect(mock.liveBytes > 64 * MiB, "the device tier of a 2 GiB card retains " + std::to_string(mock.liveBytes / MiB) + " MiB, less than half of its budget");
+    DeviceBuffer probe(context, 12 * MiB, usage);
+    Expect(probe.Handle() != first, "the least recently used device buffer of a 2 GiB card survived the eviction");
+    const auto made = mock.allocations;
+    DeviceBuffer recent(context, 23 * MiB, usage);
+    Expect(recent.Handle() == last && mock.allocations == made, "the most recently used device buffer of a 2 GiB card was not retained");
+}
+
 void AddressAndHostUnchanged() {
     mock = MockDevice{};
     auto context = mockContext();
@@ -252,6 +291,7 @@ int main() {
         LargerClass();
         KeptUntilFence();
         Budget();
+        HeapBudget();
         AddressAndHostUnchanged();
         SmallDeviceClasses();
     } catch (const std::exception& error) {
